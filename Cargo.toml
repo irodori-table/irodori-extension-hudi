@@ -27,6 +27,9 @@ irodori-connector-abi = { git = "https://github.com/hjosugi/irodori-kit", tag = 
 duckdb = { version = "1", default-features = false }
 serde_json = "1"
 
+[dev-dependencies]
+tempfile = "3"
+
 [profile.dev.package."*"]
 debug = 0
 
