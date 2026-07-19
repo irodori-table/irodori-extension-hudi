@@ -6,6 +6,7 @@
 pub use irodori_connector_abi as abi;
 
 mod driver;
+mod hudi;
 
 irodori_connector_abi::irodori_export_connector!(
     engine: "hudi",

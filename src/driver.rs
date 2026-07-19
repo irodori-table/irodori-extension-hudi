@@ -4,6 +4,7 @@ use std::sync::{Mutex, OnceLock};
 use serde_json::{json, Map, Value};
 
 use crate::abi::{self, IrodoriConnectorBuffer};
+use crate::hudi;
 use crate::{ABI_VERSION, CONFIG_JSON, DRIVER_LINKED, ENGINE, MANIFEST_JSON};
 
 static CONNECTIONS: OnceLock<Mutex<HashMap<String, LakehouseConnection>>> = OnceLock::new();
@@ -231,7 +232,19 @@ fn configure_connection(conn: &duckdb::Connection, request: &Value) -> Result<()
             load_extension(conn, "iceberg", true)?;
             format!("create or replace view {view} as select * from iceberg_scan({escaped_path})")
         }
-        "hudi" | "hive" => {
+        "hudi" => {
+            load_extension(conn, "httpfs", false)?;
+            if raw_parquet_requested(request) {
+                let pattern = parquet_pattern(&path);
+                format!(
+                    "create or replace view {view} as select * from read_parquet({}, hive_partitioning=true, union_by_name=true)",
+                    sql_string(&pattern)
+                )
+            } else {
+                return hudi::create_cow_view(conn, &path, &view);
+            }
+        }
+        "hive" => {
             load_extension(conn, "httpfs", false)?;
             let pattern = parquet_pattern(&path);
             format!(
@@ -476,7 +489,14 @@ fn clean_identifier(value: &str) -> String {
     out
 }
 
-fn sql_string(value: &str) -> String {
+/// Explicit opt-out of timeline-aware reading: scan every parquet file under
+/// the path even though that returns superseded row versions on Hudi tables.
+fn raw_parquet_requested(request: &Value) -> bool {
+    option_string(request, &["rawParquet", "rawParquetGlob"])
+        .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1")
+}
+
+pub(crate) fn sql_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
@@ -571,6 +591,186 @@ mod tests {
         assert_eq!(
             parquet_pattern("s3://bucket/table"),
             "s3://bucket/table/**/*.parquet"
+        );
+    }
+}
+
+#[cfg(test)]
+mod hudi_tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+
+    /// Builds a synthetic Hudi copy-on-write table:
+    /// - commit 001 writes file groups f1 (2 rows) and f2 (1 row)
+    /// - commit 002 rewrites f1 (updated rows; the 001 slice is superseded)
+    /// - replacecommit 003 replaces f2 with new file group f3
+    ///
+    /// A correct reader sees f1@002 + f3; a raw glob also returns f1@001 and
+    /// f2, i.e. superseded and replaced rows.
+    fn write_cow_fixture(base: &Path) {
+        let writer = duckdb::Connection::open_in_memory().expect("fixture connection");
+        let hoodie = base.join(".hoodie");
+        fs::create_dir_all(base.join("2024")).expect("partition dir");
+        fs::create_dir_all(&hoodie).expect(".hoodie dir");
+        fs::write(
+            hoodie.join("hoodie.properties"),
+            "hoodie.table.name=fixture\nhoodie.table.type=COPY_ON_WRITE\nhoodie.table.version=6\n",
+        )
+        .expect("properties");
+
+        let parquet = |file: &str, rows: &str| {
+            let path = base.join("2024").join(file);
+            writer
+                .execute_batch(&format!(
+                    "copy ({rows}) to {} (format parquet)",
+                    sql_string(&path.to_string_lossy())
+                ))
+                .expect("write parquet");
+        };
+        parquet(
+            "f1_0-1-0_001.parquet",
+            "select * from (values (1, 'a-v1'), (2, 'b-v1')) t(id, val)",
+        );
+        parquet(
+            "f2_0-1-0_001.parquet",
+            "select * from (values (3, 'c-v1')) t(id, val)",
+        );
+        parquet(
+            "f1_0-2-0_002.parquet",
+            "select * from (values (1, 'a-v2'), (2, 'b-v2')) t(id, val)",
+        );
+        parquet(
+            "f3_0-3-0_003.parquet",
+            "select * from (values (4, 'd-v1')) t(id, val)",
+        );
+
+        fs::write(
+            hoodie.join("001.commit"),
+            r#"{"partitionToWriteStats":{"2024":[
+                {"fileId":"f1","path":"2024/f1_0-1-0_001.parquet"},
+                {"fileId":"f2","path":"2024/f2_0-1-0_001.parquet"}]}}"#,
+        )
+        .expect("commit 001");
+        fs::write(
+            hoodie.join("002.commit"),
+            r#"{"partitionToWriteStats":{"2024":[
+                {"fileId":"f1","path":"2024/f1_0-2-0_002.parquet"}]}}"#,
+        )
+        .expect("commit 002");
+        fs::write(
+            hoodie.join("003.replacecommit"),
+            r#"{"partitionToWriteStats":{"2024":[
+                {"fileId":"f3","path":"2024/f3_0-3-0_003.parquet"}]},
+                "partitionToReplaceFileIds":{"2024":["f2"]}}"#,
+        )
+        .expect("replacecommit 003");
+        // Pending instants must be ignored by completed-commit globs.
+        fs::write(hoodie.join("004.commit.requested"), "").expect("requested");
+        fs::write(hoodie.join("004.inflight"), "").expect("inflight");
+    }
+
+    fn view_rows(conn: &duckdb::Connection) -> Vec<(i64, String)> {
+        let mut stmt = conn
+            .prepare("select id, val from lakehouse_table order by id, val")
+            .expect("prepare view query");
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query view");
+        rows.collect::<Result<Vec<_>, _>>().expect("collect rows")
+    }
+
+    fn connect_request(base: &Path) -> Value {
+        json!({
+            "method": "connect",
+            "options": {"tablePath": base.to_string_lossy()}
+        })
+    }
+
+    #[test]
+    fn cow_view_reads_only_latest_file_slices() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_cow_fixture(dir.path());
+        let conn = duckdb::Connection::open_in_memory().expect("connection");
+        configure_connection(&conn, &connect_request(dir.path())).expect("configure");
+        assert_eq!(
+            view_rows(&conn),
+            vec![
+                (1, "a-v2".to_string()),
+                (2, "b-v2".to_string()),
+                (4, "d-v1".to_string()),
+            ],
+            "view must contain only the latest file slices (no superseded or replaced rows)"
+        );
+    }
+
+    #[test]
+    fn raw_parquet_opt_in_scans_every_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_cow_fixture(dir.path());
+        let conn = duckdb::Connection::open_in_memory().expect("connection");
+        let mut request = connect_request(dir.path());
+        request["options"]["rawParquet"] = json!(true);
+        configure_connection(&conn, &request).expect("configure");
+        assert_eq!(
+            view_rows(&conn).len(),
+            6,
+            "explicit rawParquet opt-out must keep the old glob-everything behavior"
+        );
+    }
+
+    #[test]
+    fn merge_on_read_tables_are_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_cow_fixture(dir.path());
+        fs::write(
+            dir.path().join(".hoodie/hoodie.properties"),
+            "hoodie.table.name=fixture\nhoodie.table.type=MERGE_ON_READ\n",
+        )
+        .expect("properties");
+        let conn = duckdb::Connection::open_in_memory().expect("connection");
+        let error = configure_connection(&conn, &connect_request(dir.path()))
+            .expect_err("merge-on-read must be rejected");
+        assert!(
+            error.contains("Merge-on-Read"),
+            "expected a Merge-on-Read explanation, got: {error}"
+        );
+    }
+
+    #[test]
+    fn non_hudi_directories_fail_with_guidance() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = duckdb::Connection::open_in_memory().expect("fixture connection");
+        let path = dir.path().join("plain.parquet");
+        writer
+            .execute_batch(&format!(
+                "copy (select 1 as id) to {} (format parquet)",
+                sql_string(&path.to_string_lossy())
+            ))
+            .expect("write parquet");
+        let conn = duckdb::Connection::open_in_memory().expect("connection");
+        let error = configure_connection(&conn, &connect_request(dir.path()))
+            .expect_err("non-Hudi directories must not be scanned silently");
+        assert!(
+            error.contains("rawParquet"),
+            "expected guidance towards rawParquet opt-out, got: {error}"
+        );
+    }
+
+    #[test]
+    fn unreadable_timeline_formats_are_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_cow_fixture(dir.path());
+        fs::write(dir.path().join(".hoodie/005.commit"), b"\x01\x02not-json")
+            .expect("binary commit");
+        let conn = duckdb::Connection::open_in_memory().expect("connection");
+        let error = configure_connection(&conn, &connect_request(dir.path()))
+            .expect_err("unknown timeline formats must be rejected, not skipped");
+        assert!(
+            error.contains("not JSON"),
+            "expected an unsupported-timeline explanation, got: {error}"
         );
     }
 }
