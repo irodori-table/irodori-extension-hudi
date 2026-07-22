@@ -3,7 +3,7 @@
   "manifestVersion": 1,
   "id": "irodori.hudi",
   "name": "Hudi Connector",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "irodori",
   "description": "Hudi Connector contributes the Hudi database connector through the native connector ABI.",
   "license": "MIT OR 0BSD",
