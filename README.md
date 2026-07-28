@@ -1,3 +1,6 @@
+<!-- i18n: language-switcher -->
+[English](README.md) | [日本語](README.ja.md)
+
 # Hudi Connector
 
 Native Irodori Table connector extension for Hudi.
