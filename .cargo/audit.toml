@@ -1,0 +1,10 @@
+# rkyv 0.7 reaches the lockfile as an optional dependency of rust_decimal that
+# nothing turns on — `cargo tree -i rkyv` prints nothing, so the crate is never
+# compiled or linked here. cargo-audit reads the lockfile rather than the
+# resolved feature set, so it reports the advisory regardless.
+#
+# RUSTSEC-2026-0235 is fixed in rkyv 0.8.17, which rust_decimal's optional
+# `^0.7.46` requirement cannot reach. Remove this entry once rust_decimal stops
+# offering its 0.7 feature, and let the advisory surface again.
+[advisories]
+ignore = ["RUSTSEC-2026-0235"]
