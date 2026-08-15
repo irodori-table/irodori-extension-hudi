@@ -260,6 +260,10 @@ fn configure_connection(conn: &duckdb::Connection, request: &Value) -> Result<()
 }
 
 fn apply_settings(conn: &duckdb::Connection, request: &Value) -> Result<(), String> {
+    for statement in secret_statements(request) {
+        conn.execute_batch(&statement)
+            .map_err(|err| format!("DuckDB credential setup failed: {err}"))?;
+    }
     for (field, setting) in [
         ("s3Region", "s3_region"),
         ("region", "s3_region"),
@@ -494,6 +498,177 @@ fn clean_identifier(value: &str) -> String {
 fn raw_parquet_requested(request: &Value) -> bool {
     option_string(request, &["rawParquet", "rawParquetGlob"])
         .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1")
+}
+
+/// The object-store credentials a profile implies, as DuckDB `CREATE SECRET`
+/// statements.
+///
+/// The connector used to forward a handful of `SET s3_*` settings, which covers
+/// exactly one of the credential sources `connector.config.json` declares:
+/// a static access key. DuckDB's secret manager is the surface for the rest —
+/// the AWS credential chain (and with it SSO and web identity), and the Azure
+/// providers.
+///
+/// Pure on purpose. The statements are the whole behaviour worth testing, and
+/// asserting on them needs no DuckDB, no network, and no credentials.
+fn secret_statements(request: &Value) -> Vec<String> {
+    let mut statements = Vec::new();
+    if let Some(s3) = s3_secret(request) {
+        statements.push(s3);
+    }
+    if let Some(azure) = azure_secret(request) {
+        statements.push(azure);
+    }
+    statements
+}
+
+/// `CREATE SECRET` for S3-compatible storage, or `None` when the profile names
+/// no S3 credential source and DuckDB's own defaults should stand.
+fn s3_secret(request: &Value) -> Option<String> {
+    let mut params: Vec<(&str, String)> = Vec::new();
+
+    let key_id = option_string(
+        request,
+        &["s3AccessKeyId", "accessKeyId", "awsAccessKeyId", "user"],
+    )
+    .filter(|value| looks_like_access_key_id(value));
+    let secret = option_string(
+        request,
+        &[
+            "s3SecretAccessKey",
+            "secretAccessKey",
+            "awsSecretAccessKey",
+            "password",
+        ],
+    );
+    let session_token = option_string(
+        request,
+        &["s3SessionToken", "sessionToken", "awsSessionToken"],
+    );
+    let profile = option_string(request, &["awsProfile", "profile"]);
+    let chain = option_string(request, &["awsCredentialChain", "credentialChain"]);
+    let use_chain = option_string(request, &["awsUseCredentialChain", "useCredentialChain"])
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes"));
+
+    // A static key pair is an explicit instruction; anything else that names a
+    // credential source falls through to the chain, which is what carries SSO,
+    // web identity, ECS/IMDS, and a profile's own `role_arn`.
+    match (key_id, secret) {
+        (Some(key_id), Some(secret)) => {
+            params.push(("PROVIDER", "config".to_string()));
+            params.push(("KEY_ID", sql_string(&key_id)));
+            params.push(("SECRET", sql_string(&secret)));
+            if let Some(token) = session_token {
+                params.push(("SESSION_TOKEN", sql_string(&token)));
+            }
+        }
+        _ if use_chain || profile.is_some() || chain.is_some() => {
+            params.push(("PROVIDER", "credential_chain".to_string()));
+            if let Some(chain) = chain {
+                params.push(("CHAIN", sql_string(&chain)));
+            }
+            if let Some(profile) = profile {
+                params.push(("PROFILE", sql_string(&profile)));
+            }
+        }
+        _ => return None,
+    }
+
+    for (option, key) in [
+        (["s3Region", "region", "awsRegion"].as_slice(), "REGION"),
+        (["s3Endpoint", "endpoint"].as_slice(), "ENDPOINT"),
+        (["s3UrlStyle", "urlStyle"].as_slice(), "URL_STYLE"),
+    ] {
+        if let Some(value) = option_string(request, option) {
+            params.push((key, sql_string(&value)));
+        }
+    }
+
+    Some(create_secret("irodori_s3", "s3", &params))
+}
+
+/// `CREATE SECRET` for Azure Blob / ADLS, or `None` when the profile names no
+/// Azure credential source.
+fn azure_secret(request: &Value) -> Option<String> {
+    let mut params = azure_provider_params(request)?;
+    if let Some(account) = option_string(request, &["azureAccountName", "accountName"]) {
+        params.push(("ACCOUNT_NAME", sql_string(&account)));
+    }
+    Some(create_secret("irodori_azure", "azure", &params))
+}
+
+/// Which Azure provider the profile is asking for, and its parameters.
+///
+/// Split out so each branch can answer for itself; a profile that names an
+/// Azure credential source but cannot complete it (a service principal with
+/// neither a secret nor a certificate) answers `None` rather than emitting a
+/// secret that cannot authenticate — that would displace whatever DuckDB could
+/// otherwise have used and fail later and less clearly.
+fn azure_provider_params(request: &Value) -> Option<Vec<(&'static str, String)>> {
+    // A SAS token is delivered as a connection string; DuckDB's config provider
+    // is the only one that accepts one.
+    if let Some(connection_string) = option_string(
+        request,
+        &["azureConnectionString", "azureSasToken", "sasToken"],
+    ) {
+        return Some(vec![
+            ("PROVIDER", "config".to_string()),
+            ("CONNECTION_STRING", sql_string(&connection_string)),
+        ]);
+    }
+
+    let tenant_id = option_string(request, &["azureTenantId", "tenantId"]);
+    let client_id = option_string(request, &["azureClientId", "clientId"]);
+    if let (Some(tenant_id), Some(client_id)) = (tenant_id, client_id) {
+        // Secret or certificate — a service principal authenticates with one or
+        // the other, never neither.
+        let credential = match (
+            option_string(request, &["azureClientSecret", "clientSecret"]),
+            option_string(
+                request,
+                &["azureClientCertificatePath", "clientCertificatePath"],
+            ),
+        ) {
+            (Some(secret), _) => ("CLIENT_SECRET", sql_string(&secret)),
+            (None, Some(path)) => ("CLIENT_CERTIFICATE_PATH", sql_string(&path)),
+            (None, None) => return None,
+        };
+        return Some(vec![
+            ("PROVIDER", "service_principal".to_string()),
+            ("TENANT_ID", sql_string(&tenant_id)),
+            ("CLIENT_ID", sql_string(&client_id)),
+            credential,
+        ]);
+    }
+
+    // `cli`, `managed_identity`, `env`, … — this is what carries Azure AD
+    // interactive login and managed identity.
+    let chain = option_string(request, &["azureCredentialChain", "azureChain"])?;
+    Some(vec![
+        ("PROVIDER", "credential_chain".to_string()),
+        ("CHAIN", sql_string(&chain)),
+    ])
+}
+
+fn create_secret(name: &str, kind: &str, params: &[(&str, String)]) -> String {
+    let body = params
+        .iter()
+        .map(|(key, value)| format!("    {key} {value}"))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!("create or replace secret {name} (\n    TYPE {kind},\n{body}\n);")
+}
+
+/// An AWS access key id is 20 uppercase alphanumerics beginning with `A`
+/// (`AKIA…` long-term, `ASIA…` temporary). The connection form overloads `user`
+/// for both a profile name and an access key id, so the shape is what tells
+/// them apart.
+fn looks_like_access_key_id(value: &str) -> bool {
+    value.len() == 20
+        && value.starts_with('A')
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
 
 pub(crate) fn sql_string(value: &str) -> String {
@@ -771,6 +946,175 @@ mod hudi_tests {
         assert!(
             error.contains("not JSON"),
             "expected an unsupported-timeline explanation, got: {error}"
+        );
+    }
+
+    fn request(options: Value) -> Value {
+        json!({ "profile": { "options": options } })
+    }
+
+    #[test]
+    fn a_profile_with_no_credential_source_emits_no_secret() {
+        // DuckDB's own defaults should stand; emitting an empty secret would
+        // override them with nothing.
+        assert!(secret_statements(&request(json!({}))).is_empty());
+        assert!(secret_statements(&request(json!({ "region": "ap-northeast-1" }))).is_empty());
+    }
+
+    #[test]
+    fn a_static_key_pair_becomes_a_config_secret() {
+        let statements = secret_statements(&request(json!({
+            "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+            "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "sessionToken": "FQoGZXIvYXdzEBYa",
+            "region": "ap-northeast-1"
+        })));
+        assert_eq!(statements.len(), 1);
+        let sql = &statements[0];
+        assert!(sql.contains("TYPE s3"), "{sql}");
+        assert!(sql.contains("PROVIDER config"), "{sql}");
+        assert!(sql.contains("KEY_ID 'AKIAIOSFODNN7EXAMPLE'"), "{sql}");
+        assert!(sql.contains("SESSION_TOKEN 'FQoGZXIvYXdzEBYa'"), "{sql}");
+        assert!(sql.contains("REGION 'ap-northeast-1'"), "{sql}");
+    }
+
+    #[test]
+    fn a_profile_name_becomes_a_credential_chain_secret() {
+        // This is the path that carries SSO, web identity, ECS/IMDS, and a
+        // profile's own role_arn — none of which a `SET s3_*` can express.
+        let statements = secret_statements(&request(json!({ "awsProfile": "analytics" })));
+        assert_eq!(statements.len(), 1);
+        let sql = &statements[0];
+        assert!(sql.contains("PROVIDER credential_chain"), "{sql}");
+        assert!(sql.contains("PROFILE 'analytics'"), "{sql}");
+    }
+
+    #[test]
+    fn an_explicit_chain_is_passed_through() {
+        let statements = secret_statements(&request(json!({
+            "awsCredentialChain": "sso;env;instance"
+        })));
+        assert!(
+            statements[0].contains("CHAIN 'sso;env;instance'"),
+            "{:?}",
+            statements
+        );
+    }
+
+    #[test]
+    fn a_static_key_pair_wins_over_the_chain() {
+        // Explicit credentials are an instruction, not a hint.
+        let statements = secret_statements(&request(json!({
+            "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+            "secretAccessKey": "secret",
+            "awsProfile": "analytics"
+        })));
+        assert!(
+            statements[0].contains("PROVIDER config"),
+            "{:?}",
+            statements
+        );
+        assert!(
+            !statements[0].contains("credential_chain"),
+            "{:?}",
+            statements
+        );
+    }
+
+    #[test]
+    fn a_user_that_is_not_an_access_key_id_is_not_a_credential() {
+        // The form overloads `user` for both a profile name and an access key
+        // id; only the access-key shape may become KEY_ID.
+        let statements = secret_statements(&request(json!({
+            "user": "analytics", "password": "secret"
+        })));
+        assert!(statements.is_empty(), "{statements:?}");
+        assert!(looks_like_access_key_id("ASIAIOSFODNN7EXAMPLE"));
+        assert!(!looks_like_access_key_id("analytics"));
+    }
+
+    #[test]
+    fn an_azure_service_principal_becomes_a_service_principal_secret() {
+        let statements = secret_statements(&request(json!({
+            "azureTenantId": "tenant",
+            "azureClientId": "client",
+            "azureClientSecret": "shh",
+            "azureAccountName": "lakehouse"
+        })));
+        let sql = statements.last().expect("an azure secret");
+        assert!(sql.contains("TYPE azure"), "{sql}");
+        assert!(sql.contains("PROVIDER service_principal"), "{sql}");
+        assert!(sql.contains("CLIENT_SECRET 'shh'"), "{sql}");
+        assert!(sql.contains("ACCOUNT_NAME 'lakehouse'"), "{sql}");
+    }
+
+    #[test]
+    fn an_azure_service_principal_can_authenticate_with_a_certificate() {
+        let statements = secret_statements(&request(json!({
+            "azureTenantId": "tenant",
+            "azureClientId": "client",
+            "azureClientCertificatePath": "/etc/ssl/sp.pem"
+        })));
+        let sql = statements.last().expect("an azure secret");
+        assert!(
+            sql.contains("CLIENT_CERTIFICATE_PATH '/etc/ssl/sp.pem'"),
+            "{sql}"
+        );
+        assert!(!sql.contains("CLIENT_SECRET"), "{sql}");
+    }
+
+    #[test]
+    fn an_azure_service_principal_without_a_credential_emits_nothing() {
+        // Emitting a secret that cannot authenticate would replace whatever
+        // DuckDB could otherwise have used, and fail later and less clearly.
+        let statements = secret_statements(&request(json!({
+            "azureTenantId": "tenant", "azureClientId": "client"
+        })));
+        assert!(statements.is_empty(), "{statements:?}");
+    }
+
+    #[test]
+    fn an_azure_sas_token_becomes_a_connection_string_secret() {
+        let statements = secret_statements(&request(json!({
+            "azureSasToken": "BlobEndpoint=https://x.blob.core.windows.net/;SharedAccessSignature=sv=2022"
+        })));
+        let sql = statements.last().expect("an azure secret");
+        assert!(sql.contains("PROVIDER config"), "{sql}");
+        assert!(sql.contains("SharedAccessSignature=sv=2022"), "{sql}");
+    }
+
+    #[test]
+    fn an_azure_chain_carries_managed_identity_and_cli_login() {
+        let statements = secret_statements(&request(json!({
+            "azureCredentialChain": "managed_identity;cli"
+        })));
+        let sql = statements.last().expect("an azure secret");
+        assert!(sql.contains("PROVIDER credential_chain"), "{sql}");
+        assert!(sql.contains("CHAIN 'managed_identity;cli'"), "{sql}");
+    }
+
+    #[test]
+    fn s3_and_azure_credentials_coexist() {
+        // A table can live in one store and its catalog in another.
+        let statements = secret_statements(&request(json!({
+            "awsProfile": "analytics",
+            "azureCredentialChain": "cli"
+        })));
+        assert_eq!(statements.len(), 2, "{statements:?}");
+        assert!(statements[0].contains("TYPE s3"));
+        assert!(statements[1].contains("TYPE azure"));
+    }
+
+    #[test]
+    fn secret_values_are_quoted_against_injection() {
+        let statements = secret_statements(&request(json!({
+            "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+            "secretAccessKey": "it's a secret"
+        })));
+        assert!(
+            statements[0].contains("SECRET 'it''s a secret'"),
+            "{:?}",
+            statements
         );
     }
 }
