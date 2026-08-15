@@ -1,3 +1,4 @@
+use irodori_connector_abi::{option_string, redact};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 
@@ -79,7 +80,7 @@ fn connect(request: &Value) -> IrodoriConnectorBuffer {
     };
     let redaction_values = redaction_values(request);
     if let Err(err) = configure_connection(&conn, request) {
-        return abi::error("connector.connectFailed", redact(&redaction_values, &err));
+        return abi::error("connector.connectFailed", redact(&err, &redaction_values));
     }
     let server_version = conn
         .query_row("select version()", [], |row| row.get::<_, String>(0))
@@ -149,7 +150,7 @@ fn query(request: &Value) -> IrodoriConnectorBuffer {
         ])),
         Err(err) => abi::error(
             "connector.queryFailed",
-            redact(&connection.redaction_values, &err),
+            redact(&err, &connection.redaction_values),
         ),
     }
 }
@@ -178,7 +179,7 @@ fn metadata(request: &Value) -> IrodoriConnectorBuffer {
         ])),
         Err(err) => abi::error(
             "connector.metadataFailed",
-            redact(&connection.redaction_values, &err),
+            redact(&err, &connection.redaction_values),
         ),
     }
 }
@@ -675,47 +676,6 @@ pub(crate) fn sql_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn option_string(request: &Value, fields: &[&str]) -> Option<String> {
-    request_containers(request)
-        .into_iter()
-        .find_map(|container| {
-            fields.iter().find_map(|field| {
-                container
-                    .get(*field)
-                    .map(|value| match value {
-                        Value::String(value) => value.clone(),
-                        Value::Number(value) => value.to_string(),
-                        Value::Bool(value) => value.to_string(),
-                        _ => String::new(),
-                    })
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-            })
-        })
-}
-
-fn request_containers(request: &Value) -> Vec<&Value> {
-    [
-        Some(request),
-        request.get("profile"),
-        request.get("options"),
-        request.get("auth"),
-        request.get("secrets"),
-        request
-            .get("profile")
-            .and_then(|profile| profile.get("options")),
-        request
-            .get("profile")
-            .and_then(|profile| profile.get("auth")),
-        request
-            .get("profile")
-            .and_then(|profile| profile.get("secrets")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
-}
-
 fn redaction_values(request: &Value) -> Vec<String> {
     let mut values = Vec::new();
     for field in [
@@ -735,16 +695,6 @@ fn redaction_values(request: &Value) -> Vec<String> {
         }
     }
     values
-}
-
-fn redact(values: &[String], message: &str) -> String {
-    values.iter().fold(message.to_string(), |message, secret| {
-        if secret.is_empty() {
-            message
-        } else {
-            message.replace(secret, "****")
-        }
-    })
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
