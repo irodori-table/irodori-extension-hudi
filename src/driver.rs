@@ -460,7 +460,7 @@ fn cell_to_json(row: &duckdb::Row, index: usize) -> Value {
         Ok(DuckValue::Float(value)) => json!(value as f64),
         Ok(DuckValue::Double(value)) => json!(value),
         Ok(DuckValue::Text(value)) => Value::String(value),
-        Ok(DuckValue::Blob(value)) => Value::String(format!("\\x{}", hex_encode(&value))),
+        Ok(DuckValue::Blob(value)) => Value::String(format!("\\x{}", abi::hex_encode(&value))),
         Ok(other) => Value::String(format!("{other:?}")),
         Err(_) => Value::Null,
     }
@@ -695,14 +695,6 @@ fn redaction_values(request: &Value) -> Vec<String> {
         }
     }
     values
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push_str(&format!("{byte:02x}"));
-    }
-    output
 }
 
 #[cfg(test)]
