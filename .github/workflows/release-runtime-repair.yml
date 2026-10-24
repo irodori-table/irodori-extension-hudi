@@ -1,0 +1,23 @@
+name: Release runtime repair
+
+# Rebuild an existing immutable source tag with the fixed runtime staging.
+# The regular release workflow and its foundation version policy are retained.
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing source tag to build and publish"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  extension-release:
+    uses: irodori-table/irodori-kit/.github/workflows/extension-release.yml@3bc665c9d72437d47300cf1aabaefe8c90aea2e6
+    with:
+      release_tag: ${{ inputs.release_tag }}
+      duckdb_backed: true
+    secrets:
+      catalog_token: ${{ secrets.IRODORI_CATALOG_TOKEN }}
