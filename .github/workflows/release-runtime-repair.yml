@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   extension-release:
-    uses: irodori-table/irodori-kit/.github/workflows/extension-release.yml@3bc665c9d72437d47300cf1aabaefe8c90aea2e6
+    uses: irodori-table/irodori-kit/.github/workflows/extension-release.yml@e7deab5f6fd11f27ea87503053d6f7544bfdb302
     with:
       release_tag: ${{ inputs.release_tag }}
       duckdb_backed: true
